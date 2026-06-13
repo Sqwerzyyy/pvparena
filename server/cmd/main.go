@@ -1,15 +1,35 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	ws "github.com/Sqwerzyyy/pvparena/internal/websocket"
 )
 
 func main() {
 	fmt.Println("DARX server starting...")
+
+	dsn := os.Getenv("DB_DSN")
+	if dsn == "" {
+		dsn = "postgres://darx:darx_dev_pass@localhost:5433/darx?sslmode=disable"
+	}
+
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		log.Fatalf("failed to connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(context.Background()); err != nil {
+		log.Fatalf("postgres ping failed: %v", err)
+	}
+	log.Println("Connected to PostgreSQL")
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
