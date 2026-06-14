@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Sqwerzyyy/pvparena/internal/repository"
 	ws "github.com/Sqwerzyyy/pvparena/internal/websocket"
 )
 
@@ -31,6 +32,11 @@ func main() {
 	}
 	log.Println("Connected to PostgreSQL")
 
+	userRepo := repository.NewUserRepository(pool)
+	duelRepo := repository.NewDuelRepository(pool)
+
+	_ = duelRepo
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -41,7 +47,13 @@ func main() {
 		if client == nil {
 			return
 		}
-		log.Printf("Player connected: %s", client.ID)
+
+		user, err := userRepo.GetOrCreate(context.Background(), client.ID)
+		if err != nil {
+			log.Printf("Failed to get/create user %s: %v", client.ID, err)
+			return
+		}
+		log.Printf("Player connected: %s | credits: %d | rating: %d", user.WalletAddress, user.Credits, user.Rating)
 
 		go client.WritePump()
 		go client.ReadPump(func(clientID string, msg []byte) {
