@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Sqwerzyyy/pvparena/internal/matchmaking"
 	"github.com/Sqwerzyyy/pvparena/internal/repository"
 	ws "github.com/Sqwerzyyy/pvparena/internal/websocket"
 )
@@ -35,7 +36,8 @@ func main() {
 	userRepo := repository.NewUserRepository(pool)
 	duelRepo := repository.NewDuelRepository(pool)
 
-	_ = duelRepo
+	matchmaker := matchmaking.NewMatchmaker(duelRepo)
+	hub := ws.NewHub(matchmaker)
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -55,8 +57,11 @@ func main() {
 		}
 		log.Printf("Player connected: %s | credits: %d | rating: %d", user.WalletAddress, user.Credits, user.Rating)
 
+		hub.Register(client)
+		defer hub.Unregister(client.ID)
+
 		go client.WritePump()
-		go client.ReadPump(func(clientID string, msg []byte) {
+		client.ReadPump(func(clientID string, msg []byte) {
 			log.Printf("Message from %s: %s", clientID, string(msg))
 			client.Send <- []byte("got your message: " + string(msg))
 		})

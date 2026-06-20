@@ -1,9 +1,12 @@
 package matchmaking
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/Sqwerzyyy/pvparena/internal/repository"
 )
 
 type Side string
@@ -47,13 +50,15 @@ type QueueKey struct {
 }
 
 type Matchmaker struct {
-	queues map[QueueKey][]*QueueEntry
-	mu     sync.Mutex
+	queues   map[QueueKey][]*QueueEntry
+	mu       sync.Mutex
+	duelRepo *repository.DuelRepository
 }
 
-func NewMatchmaker() *Matchmaker {
+func NewMatchmaker(duelRepo *repository.DuelRepository) *Matchmaker {
 	return &Matchmaker{
-		queues: make(map[QueueKey][]*QueueEntry),
+		queues:   make(map[QueueKey][]*QueueEntry),
+		duelRepo: duelRepo,
 	}
 }
 
@@ -76,7 +81,7 @@ func (m *Matchmaker) Join(playerID string, side Side, duration Duration, credits
 		playerID, side, duration, credits)
 }
 
-func (m *Matchmaker) TryMatch() *Duel {
+func (m *Matchmaker) TryMatch(ctx context.Context) (*Duel, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -92,33 +97,57 @@ func (m *Matchmaker) TryMatch() *Duel {
 			k2 := QueueKey{Side: pair[1], Duration: duration}
 
 			if len(m.queues[k1]) > 0 && len(m.queues[k2]) > 0 {
-				p1 := m.pop(k1)
-				p2 := m.pop(k2)
-				return m.createDuel(p1, p2)
+				p1 := m.peek(k1)
+				p2 := m.peek(k2)
+
+				duel, err := m.createDuel(ctx, p1, p2)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create duel in db: %w", err)
+				}
+
+				m.pop(k1)
+				m.pop(k2)
+
+				return duel, nil
 			}
 		}
 	}
 
-	return nil
+	return nil, nil
 }
 
-func (m *Matchmaker) createDuel(p1, p2 *QueueEntry) *Duel {
+func (m *Matchmaker) createDuel(ctx context.Context, p1, p2 *QueueEntry) (*Duel, error) {
+	credits := minInt(p1.Credits, p2.Credits)
+
+	record, err := m.duelRepo.Create(ctx, p1.PlayerID, string(p1.Side), string(p1.Side), int(p1.Duration), credits)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := m.duelRepo.Join(ctx, record.ID, p2.PlayerID, string(p2.Side), 0); err != nil {
+		return nil, err
+	}
+
 	duel := &Duel{
-		ID:          fmt.Sprintf("duel_%d", time.Now().UnixNano()),
+		ID:          record.ID,
 		Player1:     p1.PlayerID,
 		Player1Side: p1.Side,
 		Player2:     p2.PlayerID,
 		Player2Side: p2.Side,
-		Credits:     minInt(p1.Credits, p2.Credits),
+		Credits:     credits,
 		Duration:    p1.Duration,
 		Threshold:   0.5,
 		StartsAt:    time.Now(),
 	}
 
-	fmt.Printf("Duel created: %s(%s) vs %s(%s) — %dm for %d credits\n",
-		p1.PlayerID, p1.Side, p2.PlayerID, p2.Side, duel.Duration, duel.Credits)
+	fmt.Printf("Duel created: %s(%s) vs %s(%s) — %dm for %d credits — id: %s\n",
+		p1.PlayerID, p1.Side, p2.PlayerID, p2.Side, duel.Duration, duel.Credits, duel.ID)
 
-	return duel
+	return duel, nil
+}
+
+func (m *Matchmaker) peek(key QueueKey) *QueueEntry {
+	return m.queues[key][0]
 }
 
 func (m *Matchmaker) pop(key QueueKey) *QueueEntry {
