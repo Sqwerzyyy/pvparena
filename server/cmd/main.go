@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,6 +14,18 @@ import (
 	"github.com/Sqwerzyyy/pvparena/internal/repository"
 	ws "github.com/Sqwerzyyy/pvparena/internal/websocket"
 )
+
+type incomingMessage struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+}
+
+type joinQueuePayload struct {
+	Asset    string `json:"asset"`
+	Side     string `json:"side"`
+	Duration int    `json:"duration"`
+	Credits  int    `json:"credits"`
+}
 
 func main() {
 	fmt.Println("DARX server starting...")
@@ -36,8 +49,8 @@ func main() {
 	userRepo := repository.NewUserRepository(pool)
 	duelRepo := repository.NewDuelRepository(pool)
 
-	matchmaker := matchmaking.NewMatchmaker(duelRepo)
-	hub := ws.NewHub(matchmaker)
+	mm := matchmaking.NewMatchmaker(duelRepo)
+	hub := ws.NewHub(mm)
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -55,15 +68,36 @@ func main() {
 			log.Printf("Failed to get/create user %s: %v", client.ID, err)
 			return
 		}
-		log.Printf("Player connected: %s | credits: %d | rating: %d", user.WalletAddress, user.Credits, user.Rating)
+		log.Printf("Player connected: wallet=%s uuid=%s credits=%d rating=%d",
+			user.WalletAddress, user.ID, user.Credits, user.Rating)
+
+		// Reassign to UUID so hub and matchmaker use the same key as duels table FKs.
+		client.ID = user.ID
 
 		hub.Register(client)
 		defer hub.Unregister(client.ID)
 
 		go client.WritePump()
-		client.ReadPump(func(clientID string, msg []byte) {
-			log.Printf("Message from %s: %s", clientID, string(msg))
-			client.Send <- []byte("got your message: " + string(msg))
+		client.ReadPump(func(clientID string, raw []byte) {
+			var msg incomingMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				log.Printf("WS: bad message from %s: %v", clientID, err)
+				return
+			}
+
+			switch msg.Type {
+			case "join_queue":
+				var p joinQueuePayload
+				if err := json.Unmarshal(msg.Data, &p); err != nil {
+					log.Printf("WS: bad join_queue payload from %s: %v", clientID, err)
+					return
+				}
+				mm.Join(clientID, p.Asset, matchmaking.Side(p.Side), matchmaking.Duration(p.Duration), p.Credits)
+				hub.TryMatchAndNotify(context.Background())
+
+			default:
+				log.Printf("WS: unknown message type %q from %s", msg.Type, clientID)
+			}
 		})
 	})
 

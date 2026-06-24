@@ -24,8 +24,15 @@ const (
 	Duration5m Duration = 5
 )
 
+// DuelStore abstracts DB operations so TryMatch can be tested without Postgres.
+type DuelStore interface {
+	Create(ctx context.Context, player1ID, asset, directionP1 string, timeframe, credits int) (*repository.DuelRecord, error)
+	Join(ctx context.Context, duelID, player2ID, directionP2 string, priceOpen float64) error
+}
+
 type QueueEntry struct {
 	PlayerID string
+	Asset    string
 	Side     Side
 	Duration Duration
 	Credits  int
@@ -38,6 +45,7 @@ type Duel struct {
 	Player1Side Side
 	Player2     string
 	Player2Side Side
+	Asset       string
 	Credits     int
 	Duration    Duration
 	Threshold   float64
@@ -45,70 +53,76 @@ type Duel struct {
 }
 
 type QueueKey struct {
+	Asset    string
 	Side     Side
 	Duration Duration
 }
 
 type Matchmaker struct {
-	queues   map[QueueKey][]*QueueEntry
-	mu       sync.Mutex
-	duelRepo *repository.DuelRepository
+	queues    map[QueueKey][]*QueueEntry
+	mu        sync.Mutex
+	duelStore DuelStore
 }
 
-func NewMatchmaker(duelRepo *repository.DuelRepository) *Matchmaker {
+func NewMatchmaker(store DuelStore) *Matchmaker {
 	return &Matchmaker{
-		queues:   make(map[QueueKey][]*QueueEntry),
-		duelRepo: duelRepo,
+		queues:    make(map[QueueKey][]*QueueEntry),
+		duelStore: store,
 	}
 }
 
-func (m *Matchmaker) Join(playerID string, side Side, duration Duration, credits int) {
+func (m *Matchmaker) Join(playerID, asset string, side Side, duration Duration, credits int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	entry := &QueueEntry{
 		PlayerID: playerID,
+		Asset:    asset,
 		Side:     side,
 		Duration: duration,
 		Credits:  credits,
 		JoinedAt: time.Now(),
 	}
 
-	key := QueueKey{Side: side, Duration: duration}
+	key := QueueKey{Asset: asset, Side: side, Duration: duration}
 	m.queues[key] = append(m.queues[key], entry)
 
-	fmt.Printf("Player %s joined queue: %s %dm for %d credits\n",
-		playerID, side, duration, credits)
+	fmt.Printf("Player %s joined queue: %s %s %dm for %d credits\n",
+		playerID, asset, side, duration, credits)
 }
 
 func (m *Matchmaker) TryMatch(ctx context.Context) (*Duel, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, duration := range []Duration{Duration1m, Duration3m, Duration5m} {
-		pairs := [][]Side{
-			{SideUp, SideDown},
-			{SideUp, SideFlat},
-			{SideDown, SideFlat},
-		}
+	assets := []string{"BTC", "ETH", "SOL"}
+	durations := []Duration{Duration1m, Duration3m, Duration5m}
+	pairs := [][]Side{
+		{SideUp, SideDown},
+		{SideUp, SideFlat},
+		{SideDown, SideFlat},
+	}
 
-		for _, pair := range pairs {
-			k1 := QueueKey{Side: pair[0], Duration: duration}
-			k2 := QueueKey{Side: pair[1], Duration: duration}
+	for _, asset := range assets {
+		for _, duration := range durations {
+			for _, pair := range pairs {
+				k1 := QueueKey{Asset: asset, Side: pair[0], Duration: duration}
+				k2 := QueueKey{Asset: asset, Side: pair[1], Duration: duration}
 
-			if len(m.queues[k1]) > 0 && len(m.queues[k2]) > 0 {
-				p1 := m.peek(k1)
-				p2 := m.peek(k2)
+				if len(m.queues[k1]) > 0 && len(m.queues[k2]) > 0 {
+					p1 := m.peek(k1)
+					p2 := m.peek(k2)
 
-				duel, err := m.createDuel(ctx, p1, p2)
-				if err != nil {
-					return nil, fmt.Errorf("failed to create duel in db: %w", err)
+					duel, err := m.createDuel(ctx, p1, p2)
+					if err != nil {
+						return nil, fmt.Errorf("failed to create duel in db: %w", err)
+					}
+
+					m.pop(k1)
+					m.pop(k2)
+
+					return duel, nil
 				}
-
-				m.pop(k1)
-				m.pop(k2)
-
-				return duel, nil
 			}
 		}
 	}
@@ -119,12 +133,12 @@ func (m *Matchmaker) TryMatch(ctx context.Context) (*Duel, error) {
 func (m *Matchmaker) createDuel(ctx context.Context, p1, p2 *QueueEntry) (*Duel, error) {
 	credits := minInt(p1.Credits, p2.Credits)
 
-	record, err := m.duelRepo.Create(ctx, p1.PlayerID, string(p1.Side), string(p1.Side), int(p1.Duration), credits)
+	record, err := m.duelStore.Create(ctx, p1.PlayerID, p1.Asset, string(p1.Side), int(p1.Duration), credits)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := m.duelRepo.Join(ctx, record.ID, p2.PlayerID, string(p2.Side), 0); err != nil {
+	if err := m.duelStore.Join(ctx, record.ID, p2.PlayerID, string(p2.Side), 0); err != nil {
 		return nil, err
 	}
 
@@ -134,14 +148,15 @@ func (m *Matchmaker) createDuel(ctx context.Context, p1, p2 *QueueEntry) (*Duel,
 		Player1Side: p1.Side,
 		Player2:     p2.PlayerID,
 		Player2Side: p2.Side,
+		Asset:       p1.Asset,
 		Credits:     credits,
 		Duration:    p1.Duration,
 		Threshold:   0.5,
 		StartsAt:    time.Now(),
 	}
 
-	fmt.Printf("Duel created: %s(%s) vs %s(%s) — %dm for %d credits — id: %s\n",
-		p1.PlayerID, p1.Side, p2.PlayerID, p2.Side, duel.Duration, duel.Credits, duel.ID)
+	fmt.Printf("Duel created: %s(%s) vs %s(%s) — %s %dm for %d credits — id: %s\n",
+		p1.PlayerID, p1.Side, p2.PlayerID, p2.Side, p1.Asset, duel.Duration, duel.Credits, duel.ID)
 
 	return duel, nil
 }
